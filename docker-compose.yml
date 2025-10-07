@@ -1,1 +1,81 @@
-t
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}
+      - POSTGRES_DB=${DB_NAME:-mcc}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d # runs init scripts at container creation
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-mcc}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mcc-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DB_HOST=db
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=${DB_NAME:-mcc}
+      - JWT_SECRET=${JWT_SECRET:-change-me}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+    volumes:
+      - ./backend/uploads:/usr/src/app/uploads
+    ports:
+      - "4000:4000"
+    networks:
+      - mcc-net
+    healthcheck:
+      test: ["CMD", "node", "src/server.js", "--health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      - VITE_API_URL=${VITE_API_URL:-http://localhost:4000}
+    ports:
+      - "3000:80"
+    networks:
+      - mcc-net
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:1.25-alpine
+    depends_on:
+      - frontend
+      - backend
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - mcc-net
+
+volumes:
+  db_data:
+
+networks:
+  mcc-net:
+    driver: bridge
+
