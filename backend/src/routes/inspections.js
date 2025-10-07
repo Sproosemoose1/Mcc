@@ -1,69 +1,168 @@
-/*
-backend/src/routes/inspections.js
-Routes to create/list/update inspections and upload photos.
-*/
-
-const express = require('express');
-const multer = require('multer');
+const { authenticate, authorize } = require('../middleware/auth');
 const Inspection = require('../models/Inspection');
-const { authMiddleware } = require('../middleware/auth');
+const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
-
-const router = express.Router();
-
-// configure multer disk storage (in production use S3 or similar)
-const uploadDir = path.join(__dirname, '../../uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-        const ext = path.extname(file.originalname);
-        cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+  destination: 'uploads/inspections/',
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`);
+  }
+});
+const upload = multer({ storage });
+
+// Get all inspections
+router.get('/', authenticate, async (req, res) => {
+  try {
+    const filters = {
+      status: req.query.status,
+      assignedTo: req.query.assignedTo,
+      projectId: req.query.projectId,
+      type: req.query.type,
+      priority: req.query.priority
+    };
+
+    const inspections = await Inspection.findAll(filters);
+    res.json(inspections);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single inspection
+router.get('/:id', authenticate, async (req, res) => {
+  try {
+    const inspection = await Inspection.findById(req.params.id);
+    if (!inspection) {
+      return res.status(404).json({ error: 'Inspection not found' });
     }
-});
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10 MB limit
-
-// create inspection
-router.post('/', authMiddleware, async (req, res, next) => {
-    try {
-        const { title, description, project_id } = req.body;
-        const created = await Inspection.create({ title, description, project_id, created_by: req.user.id });
-        // emit via socket.io (attached to req.app.locals.io)
-        if (req.app.locals.io) req.app.locals.io.emit('inspection:created', created);
-        res.json({ inspection: created });
-    } catch (err) { next(err); }
+    res.json(inspection);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// list by project
-router.get('/project/:projectId', authMiddleware, async (req, res, next) => {
-    try {
-        const list = await Inspection.listByProject(req.params.projectId);
-        res.json({ inspections: list });
-    } catch (err) { next(err); }
+// Create inspection
+router.post('/', authenticate, async (req, res) => {
+  try {
+    const inspection = await Inspection.create({
+      ...req.body,
+      createdBy: req.user.userId
+    });
+
+    await logActivity(
+      req.user.userId,
+      'create',
+      'inspection',
+      inspection.id,
+      req.ip
+    );
+
+    // Emit socket event
+    const io = req.app.get('io');
+    io.emit('inspection:created', inspection);
+
+    res.status(201).json(inspection);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// upload photo
-router.post('/:id/photos', authMiddleware, upload.single('photo'), async (req, res, next) => {
-    try {
-        const inspectionId = req.params.id;
-        if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-        const url = `/uploads/${req.file.filename}`;
-        const photo = await Inspection.addPhoto(inspectionId, url, req.user.id);
-        if (req.app.locals.io) req.app.locals.io.emit('inspection:photo', { inspectionId, photo });
-        res.json({ photo });
-    } catch (err) { next(err); }
+// Update inspection
+router.put('/:id', authenticate, async (req, res) => {
+  try {
+    const inspection = await Inspection.update(req.params.id, req.body);
+    if (!inspection) {
+      return res.status(404).json({ error: 'Inspection not found' });
+    }
+
+    await logActivity(
+      req.user.userId,
+      'update',
+      'inspection',
+      inspection.id,
+      req.ip,
+      req.body
+    );
+
+    // Emit socket event
+    const io = req.app.get('io');
+    io.emit('inspection:updated', inspection);
+
+    res.json(inspection);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// update status
-router.patch('/:id/status', authMiddleware, async (req, res, next) => {
-    try {
-        const { status } = req.body;
-        const updated = await Inspection.updateStatus(req.params.id, status);
-        if (req.app.locals.io) req.app.locals.io.emit('inspection:updated', updated);
-        res.json({ inspection: updated });
-    } catch (err) { next(err); }
+// Delete inspection
+router.delete('/:id', authenticate, authorize(['admin', 'manager']), async (req, res) => {
+  try {
+    const inspection = await Inspection.delete(req.params.id);
+    if (!inspection) {
+      return res.status(404).json({ error: 'Inspection not found' });
+    }
+
+    await logActivity(
+      req.user.userId,
+      'delete',
+      'inspection',
+      req.params.id,
+      req.ip
+    );
+
+    const io = req.app.get('io');
+    io.emit('inspection:deleted', { id: req.params.id });
+
+    res.json({ message: 'Inspection deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Upload inspection photos
+router.post('/:id/photos', authenticate, upload.array('photos', 10), async (req, res) => {
+  try {
+    const db = require('../database/connection');
+    const photos = [];
+
+    for (const file of req.files) {
+      const result = await db.query(
+        `INSERT INTO inspection_photos 
+        (inspection_id, filename, file_path, file_size, mime_type, uploaded_by)
+        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [
+          req.params.id,
+          file.originalname,
+          file.path,
+          file.size,
+          file.mimetype,
+          req.user.userId
+        ]
+      );
+      photos.push(result.rows[0]);
+    }
+
+    const io = req.app.get('io');
+    io.emit('inspection:photos-uploaded', { 
+      inspectionId: req.params.id, 
+      count: photos.length 
+    });
+
+    res.status(201).json(photos);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get inspection statistics
+router.get('/stats/overview', authenticate, async (req, res) => {
+  try {
+    const stats = await Inspection.getStats(req.query);
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 module.exports = router;
